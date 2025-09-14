@@ -1034,11 +1034,42 @@ class LlamaModel(LlamaPreTrainedModel):
             )
 
         if hasattr(self, "tree_mask") and self.tree_mask is not None:
-            tree_mask = self.tree_mask
-            tree_len = tree_mask.size(-1)
-            combined_attention_mask[:, :, -tree_len:, -tree_len:][
-                tree_mask == 0
-                ] = combined_attention_mask.min()
+            tm = self.tree_mask  # [B_tm=1, 1, Tm_q, Tm_k], float/bool 모두 허용
+
+            # combined_attention_mask가 아직 없다면(예: tgt_len==1이고 attention_mask=None),
+            # 0으로 채운 기본 마스크를 만든다.
+            if combined_attention_mask is None:
+                bsz = inputs_embeds.size(0)
+                tgt_len = input_shape[-1]
+                src_len = tgt_len + past_key_values_length
+                combined_attention_mask = torch.zeros(
+                    (bsz, 1, tgt_len, src_len),
+                    dtype=torch.float32,            # 마스크는 float32로 고정
+                    device=inputs_embeds.device,
+                )
+
+            cam = combined_attention_mask  # [B, 1, q_len, k_len]
+            B, _, q_len, k_len = cam.shape
+            _, _, tm_q, tm_k = tm.shape
+
+            # 겹치는 길이만 적용 (우하단 정렬)
+            use_q = min(q_len, tm_q)
+            use_k = min(k_len, tm_k)
+
+            if use_q > 0 and use_k > 0:
+                cam_view = cam[:, :, -use_q:, -use_k:]
+                tm_view  = tm[:, :, -use_q:, -use_k:]
+
+                # dtype 정규화 + 마스크 생성
+                if tm_view.dtype == torch.bool:
+                    bad = ~tm_view
+                else:
+                    bad = (tm_view == 0)
+
+                # -inf로 마스킹
+                cam_view.masked_fill_(bad, torch.finfo(cam_view.dtype).min)
+
+            combined_attention_mask = cam
 
         return combined_attention_mask
 

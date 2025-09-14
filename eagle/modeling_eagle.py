@@ -623,6 +623,7 @@ class Tree:
 
 
 def generate_tree_buffers_for_eagle(tree_choices, device="cuda"):
+    print("tree shape is fixed")
     TOPK = 5
     tree = Tree(tree_choices)
     tree_len = tree.num_node_wchild()

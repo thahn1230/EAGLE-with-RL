@@ -17,6 +17,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# For EAGLE-2
+
 """ PyTorch LLaMA model."""
 import copy
 import os
@@ -280,16 +282,91 @@ class LlamaAttention(nn.Module):
         key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
         value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
 
-        kv_seq_len = key_states.shape[-2]
-        if past_key_value is not None:
-            kv_seq_len += past_key_value[0].shape[-2]
-        cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
+        # kv_seq_len = key_states.shape[-2]
+        # if past_key_value is not None:
+        #     kv_seq_len += past_key_value[0].shape[-2]
+        # cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
+        # RoPE는 "현재 스텝" 토큰들에만 적용(과거 KV는 이미 적용되어 있다고 간주)
+        kv_seq_len_hint = key_states.shape[-2] + (past_key_value[0].shape[-2] if past_key_value is not None else 0)
+        cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len_hint)
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 
+        # if past_key_value is not None:
+        #     # reuse k, v, self_attention
+        #     # key_states = torch.cat([past_key_value[0], key_states], dim=2)
+        #     # value_states = torch.cat([past_key_value[1], value_states], dim=2)
+        # # 배치 축 정렬 후 concat (EAGLE-2 트리 드래프팅 호환)
+        #     pk, pv = past_key_value  # pk,pv: [B_past, nH, T_past, Hd]
+        #     ks, vv = key_states, value_states  # ks,vv: [B_cur, nH, T_new, Hd]
+
+        #     if pk.size(1) != ks.size(1) or pk.size(3) != ks.size(3):
+        #         raise RuntimeError(
+        #             f"Head/hidden mismatch: past({pk.shape}) vs cur({ks.shape})")
+
+        #     Bp, Bc = pk.size(0), ks.size(0)
+        #     if Bp != Bc:
+        #         if Bp == 1:
+        #             # 프롬프트 KV를 드래프트 노드 수(Bc)만큼 복제
+        #             expand_shape = (Bc, -1, -1, -1)
+        #             pk = pk.expand(expand_shape).contiguous()
+        #             pv = pv.expand(expand_shape).contiguous()
+        #         elif Bc == 1:
+        #             # 반대 경우: 현재 토큰을 과거 배치(Bp)에 맞춰 복제
+        #             expand_shape = (Bp, -1, -1, -1)
+        #             ks = ks.expand(expand_shape).contiguous()
+        #             vv = vv.expand(expand_shape).contiguous()
+        #         else:
+        #             raise RuntimeError(
+        #                 f"Cannot align batch: past B={Bp}, current B={Bc}")
+
+        #     key_states   = torch.cat([pk, ks], dim=2)
+        #     value_states = torch.cat([pv, vv], dim=2)
+        
+        # -------------------- BEGIN PATCH: robust KV alignment --------------------
+        def _flatten_batch_to_seq(x: torch.Tensor) -> torch.Tensor:
+            # [B, H, T, D] -> [1, H, B*T, D]
+            if x.size(0) == 1:
+                return x
+            B, H, T, D = x.shape
+            return x.permute(1, 0, 2, 3).reshape(1, H, B * T, D).contiguous()
+
         if past_key_value is not None:
-            # reuse k, v, self_attention
-            key_states = torch.cat([past_key_value[0], key_states], dim=2)
-            value_states = torch.cat([past_key_value[1], value_states], dim=2)
+            pk, pv = past_key_value  # [B_past, H_kv, T_past, D]
+            ks, vv = key_states, value_states  # [B_cur,  H_kv, T_new,  D]
+
+            # Head/hidden sanity
+            if pk.size(1) != ks.size(1) or pk.size(3) != ks.size(3):
+                raise RuntimeError(f"KV head/hidden mismatch: past={pk.shape}, cur={ks.shape}")
+
+            # 쿼리 배치(bsz)에 맞춰 정렬
+            Bp, Bc = pk.size(0), ks.size(0)
+            # 1) past 배치 정렬
+            if Bp != bsz:
+                if Bp == 1 and bsz > 1:
+                    pk = pk.expand(bsz, -1, -1, -1).contiguous()
+                    pv = pv.expand(bsz, -1, -1, -1).contiguous()
+                elif bsz == 1 and Bp > 1:
+                    # past 배치를 seq로 평탄화하여 배치=1로 맞춤 (src_len만 증가)
+                    pk = _flatten_batch_to_seq(pk)
+                    pv = _flatten_batch_to_seq(pv)
+                else:
+                    raise RuntimeError(f"Cannot align past KV: past B={Bp}, query B={bsz}")
+
+            # 2) current 배치 정렬 (대개 이미 bsz)
+            if Bc != bsz:
+                if Bc == 1 and bsz > 1:
+                    ks = ks.expand(bsz, -1, -1, -1).contiguous()
+                    vv = vv.expand(bsz, -1, -1, -1).contiguous()
+                elif bsz == 1 and Bc > 1:
+                    ks = _flatten_batch_to_seq(ks)
+                    vv = _flatten_batch_to_seq(vv)
+                else:
+                    raise RuntimeError(f"Cannot align current KV: cur B={Bc}, query B={bsz}")
+
+            # 과거 + 현재 concat (seq 축)
+            key_states   = torch.cat([pk, ks], dim=2)
+            value_states = torch.cat([pv, vv], dim=2)
+        # -------------------- END PATCH --------------------
 
         past_key_value = (key_states, value_states) if use_cache else None
 
@@ -297,6 +374,9 @@ class LlamaAttention(nn.Module):
         key_states = repeat_kv(key_states, self.num_key_value_groups)
         value_states = repeat_kv(value_states, self.num_key_value_groups)
 
+        # attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
+        # concat 이후 실제 kv 길이로 재계산
+        kv_seq_len = key_states.shape[-2]
         attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
 
         if attn_weights.size() != (bsz, self.num_heads, q_len, kv_seq_len):
@@ -306,10 +386,26 @@ class LlamaAttention(nn.Module):
             )
 
         if attention_mask is not None:
+            # if attention_mask.size() != (bsz, 1, q_len, kv_seq_len):
+            #     raise ValueError(
+            #         f"Attention mask should be of size {(bsz, 1, q_len, kv_seq_len)}, but is {attention_mask.size()}"
+            #     )
+            # mask src_len 보정 (필요시 배수 repeat 또는 pad)
+            if attention_mask.size(-1) != kv_seq_len:
+                src_len = attention_mask.size(-1)
+                if kv_seq_len % src_len == 0:
+                    rep = kv_seq_len // src_len
+                    attention_mask = attention_mask.repeat(1, 1, 1, rep)
+                else:
+                    pad = kv_seq_len - src_len
+                    if pad < 0:
+                        # 잘못 길어졌다면 잘라냄(보수적)
+                        attention_mask = attention_mask[..., -kv_seq_len:]
+                    else:
+                        # 뒤쪽에 0(=mask 영향 없음)으로 패딩
+                        attention_mask = F.pad(attention_mask, (0, pad), value=0.0)
             if attention_mask.size() != (bsz, 1, q_len, kv_seq_len):
-                raise ValueError(
-                    f"Attention mask should be of size {(bsz, 1, q_len, kv_seq_len)}, but is {attention_mask.size()}"
-                )
+                raise ValueError(f"Attention mask mismatch: got {attention_mask.size()}, want {(bsz,1,q_len,kv_seq_len)}")
             attn_weights = attn_weights + attention_mask
 
         # upcast attention to fp32
@@ -470,7 +566,7 @@ def len_list(x, n):
 
 
 class Model(nn.Module):
-    def __init__(self, config, load_emb=False, path=None, bias=True, total_tokens=63, depth=5, top_k=8, threshold=1.0):
+    def __init__(self, config, load_emb=False, path=None, bias=True, total_tokens=63, depth=5, top_k=8, expand_k=8, threshold=1.0):
         super().__init__()
 
         self.gradient_checkpointing = True
@@ -512,6 +608,8 @@ class Model(nn.Module):
             self.embed_tokens.weight.data = tensor
 
         self.top_k = top_k
+        # expand_k가 None이면 top_k와 같은 값으로 설정
+        self.expand_k = expand_k
         self.total_tokens = total_tokens - 1
         self.depth = depth
         self.threshold = math.log(threshold)
@@ -557,13 +655,25 @@ class Model(nn.Module):
                 expanded_attn_mask if combined_attention_mask is None else expanded_attn_mask + combined_attention_mask
             )
 
-        # [MODIFIED] add tree mask
+        # [MODIFIED] add tree mask (robust to size mismatch)
         if hasattr(self, "tree_mask") and self.tree_mask is not None:
-            tree_mask = self.tree_mask
-            _, _, tree_shape0, tree_shape1 = tree_mask.shape
-            combined_attention_mask[:, :, -tree_shape0:, -tree_shape1:][
-                tree_mask == 0
-                ] = torch.finfo(torch.float32).min
+            tree_mask = self.tree_mask  # shape: [1,1, M, M] (float/bool)
+
+            # combined_attention_mask: [B, 1, q_len, k_len]
+            B, _, q_len, k_len = combined_attention_mask.shape
+            _, _, tm0, tm1 = tree_mask.shape
+
+            # 겹치는 영역만 적용 (하단-우측 코너 정렬)
+            ml0 = min(q_len, tm0)  # 적용할 query 길이
+            ml1 = min(k_len, tm1)  # 적용할 key 길이
+            if ml0 > 0 and ml1 > 0:
+                view = combined_attention_mask[:, :, q_len - ml0:, k_len - ml1:]
+                tmask = tree_mask[:, :, tm0 - ml0:, tm1 - ml1:]
+                # dtype/디바이스 정렬
+                tmask = tmask.to(view.dtype).to(view.device)
+
+                # tmask==0 영역을 -inf로 마스킹
+                view[tmask == 0] = torch.finfo(view.dtype).min
 
         return combined_attention_mask
 
@@ -584,7 +694,26 @@ class Model(nn.Module):
         batch_size, seq_length, _ = hidden_states.shape
         seq_length_with_past = seq_length
         past_key_values_length = 0
+        
+        # 빈 step(=input_ids 길이 0)일 때는 NO-OP로 바로 반환
+        if input_ids is not None and input_ids.size(1) == 0:
+            if use_cache:
+                return hidden_states, past_key_values
+            else:
+                return hidden_states
 
+        # --- EMBEDDING INDEX SAFETY GUARD ---
+        if not torch.is_floating_point(input_ids):
+            if input_ids.numel() > 0:
+                min_id = int(input_ids.min())
+                max_id = int(input_ids.max())
+                vocab = int(self.embed_tokens.num_embeddings)
+                if min_id < 0 or max_id >= vocab:
+                    raise RuntimeError(
+                        f"[EAGLE2] input_ids out of range for embedding: "
+                        f"min={min_id}, max={max_id}, vocab={vocab}, shape={tuple(input_ids.shape)}"
+                    )
+        
         with torch.no_grad():
             inputs_embeds = self.embed_tokens(input_ids)
             # inputs_embeds = inputs_embeds.detach()
@@ -620,6 +749,10 @@ class Model(nn.Module):
 
         # hidden_states=self.act(self.fc(torch.cat((inputs_embeds,hidden_states),dim=-1)))
         inputs_embeds = inputs_embeds.to(hidden_states.dtype)
+        
+        assert inputs_embeds.size(1) == hidden_states.size(1), \
+            f"seq mismatch: emb={inputs_embeds.size()} vs hid={hidden_states.size()}"
+        
         hidden_states = self.fc(torch.cat((inputs_embeds, hidden_states), dim=-1))
 
         all_hidden_states = () if output_hidden_states else None
@@ -669,157 +802,398 @@ class Model(nn.Module):
     def reset_kv(self):
         self.stable_kv = None
 
+    # @torch.no_grad()
+    # def topK_genrate(self, hidden_states, input_ids, head, logits_processor):
+
+    #     input_ids = input_ids.to(hidden_states.device)
+    #     total_tokens = self.total_tokens
+    #     depth = self.depth
+    #     top_k = self.top_k
+    #     expand_k = self.expand_k
+
+    #     sample_token = input_ids[:, -1]
+
+    #     scores_list = []
+    #     parents_list = []
+    #     ss_token = []
+
+    #     input_ids = input_ids[:, 1:]
+    #     input_ids = input_ids.to(hidden_states.device)
+
+    #     len_posi = input_ids.shape[1]
+    #     self.reset()
+
+    #     # with Timer("draft many"):
+    #     if hasattr(self, "stable_kv") and self.stable_kv is not None:
+    #         kv_len = self.stable_kv[0][0].shape[2]
+    #         out_hidden, past_key_values = self(hidden_states, input_ids=input_ids[:, kv_len:],
+    #                                            past_key_values=self.stable_kv, use_cache=True)
+    #     else:
+    #         out_hidden, past_key_values = self(hidden_states, input_ids=input_ids, use_cache=True)
+    #     self.stable_kv = past_key_values
+    #     last_hidden = out_hidden[:, -1]
+
+    #     last_headout = head(last_hidden)
+
+    #     last_p = self.logsoftmax(last_headout)
+    #     top = torch.topk(last_p, top_k, dim=-1)
+    #     topk_index, topk_p = top.indices, top.values
+    #     scores = topk_p[0]
+    #     scores_list.append(scores[None])
+    #     parents_list.append(torch.zeros(1, dtype=torch.long, device=scores.device))
+    #     ss_token.append(topk_index)
+    #     input_ids = topk_index
+    #     input_hidden = last_hidden[None].repeat(1, top_k, 1)
+    #     tree_mask = self.tree_mask_init
+    #     topk_cs_index = torch.arange(top_k, device=self.embed_tokens.weight.device)
+
+    #     # 4
+    #     for i in range(depth):
+    #         self.tree_mask = tree_mask
+    #         position_ids = len_posi + self.position_ids
+    #         # with Timer("draft one"):
+    #         out_hidden, past_key_values = self(input_hidden, input_ids=input_ids, past_key_values=past_key_values,
+    #                                            position_ids=position_ids, use_cache=True)
+    #         len_posi += 1
+
+    #         # with Timer("sort1"):
+    #         # 원래 로직을 expand_k에 맞게 수정
+    #         bias1 = expand_k if i > 0 else 0
+    #         bias2 = max(0, i - 1)
+    #         # 첫 번째 레벨: top_k^2, 이후 레벨: expand_k * top_k
+    #         if i == 0:
+    #             bias = 1 + bias1
+    #         else:
+    #             bias = 1 + expand_k * top_k * bias2 + bias1
+    #             # bias = 1 + top_k + expand_k * top_k * bias2 + bias1
+    #         parents = (topk_cs_index + bias)
+    #         parents_list.append(parents)
+
+    #         last_headout = head(out_hidden[0])
+    #         last_p = self.logsoftmax(last_headout)
+
+    #         top = torch.topk(last_p, top_k, dim=-1)
+    #         topk_index, topk_p = top.indices, top.values
+
+    #         cu_scores = topk_p + scores[:, None]
+
+    #         topk_cs = torch.topk(cu_scores.view(-1), expand_k, dim=-1)
+    #         topk_cs_index, topk_cs_p = topk_cs.indices, topk_cs.values
+    #         scores = topk_cs_p
+
+    #         # 첫 번째 iteration에서는 top_k개의 노드가 있고, 이후에는 expand_k개의 노드가 있음
+    #         # current_node_count = top_k if i == 0 else expand_k
+    #         out_ids = topk_cs_index // top_k
+    #         input_hidden = out_hidden[:, out_ids]
+
+    #         input_ids = topk_index.view(-1)[topk_cs_index][None]
+
+    #         ss_token.append(topk_index)
+    #         scores_list.append(cu_scores)
+    #         tree_mask = torch.cat((tree_mask[:, :, out_ids], self.tree_mask_init), dim=3)
+
+
+
+    #     scores_list = torch.cat(scores_list, dim=0).view(-1)
+    #     ss_token_list = torch.cat(ss_token, dim=0).view(-1)
+    #     top_scores = torch.topk(scores_list, total_tokens, dim=-1)
+    #     top_scores_index = top_scores.indices
+    #     top_scores_index = torch.sort(top_scores_index).values
+
+    #     draft_tokens = ss_token_list[top_scores_index]
+    #     draft_tokens = torch.cat((sample_token, draft_tokens), dim=0)
+
+    #     draft_parents = torch.cat(parents_list, dim=0)[top_scores_index // top_k].long()
+    #     mask_index = torch.searchsorted(top_scores_index, draft_parents - 1, right=False)
+    #     # mask_index[(top_scores_index[mask_index]!=draft_parents - 1)]=-1
+    #     mask_index[draft_parents == 0] = -1
+    #     mask_index = mask_index + 1
+    #     mask_index_list = mask_index.tolist()
+    #     # with Timer("mask"):
+    #     tree_mask = torch.eye(total_tokens + 1).bool()
+    #     tree_mask[:, 0] = True
+    #     for i in range(total_tokens):
+    #         tree_mask[i + 1].add_(tree_mask[mask_index_list[i]])
+
+
+    #     tree_position_ids = torch.sum(tree_mask, dim=1) - 1
+
+    #     tree_mask = tree_mask.float()[None, None]
+    #     draft_tokens = draft_tokens[None]
+
+    #     del parents_list, scores_list, ss_token, ss_token_list, draft_parents
+
+    #     # with Timer("retrieve"):
+
+    #     max_depth = torch.max(tree_position_ids) + 1
+    #     noleaf_index = torch.unique(mask_index).tolist()
+    #     noleaf_num = len(noleaf_index) - 1
+    #     leaf_num = total_tokens - noleaf_num
+
+    #     retrieve_indices = torch.zeros(leaf_num, max_depth.item(), dtype=torch.long) - 1
+    #     retrieve_indices = retrieve_indices.tolist()
+
+    #     rid = 0
+    #     position_ids_list = tree_position_ids.tolist()
+
+    #     for i in range(total_tokens + 1):
+    #         if i not in noleaf_index:
+    #             cid = i
+    #             depth = position_ids_list[i]
+    #             for j in reversed(range(depth + 1)):
+    #                 retrieve_indices[rid][j] = cid
+    #                 cid = mask_index_list[cid - 1]
+    #             rid += 1
+
+    #     if logits_processor is not None:
+    #         maxitem = total_tokens + 5
+
+    #         def custom_sort(lst):
+    #             # sort_keys=[len(list)]
+    #             sort_keys = []
+    #             for i in range(len(lst)):
+    #                 sort_keys.append(lst[i] if lst[i] >= 0 else maxitem)
+    #             return sort_keys
+
+    #         retrieve_indices = sorted(retrieve_indices, key=custom_sort)
+
+    #     retrieve_indices = torch.tensor(retrieve_indices, dtype=torch.long)
+    #     del mask_index, mask_index_list, noleaf_index, noleaf_num, leaf_num, max_depth, rid
+    #     tree_position_ids = tree_position_ids.to(hidden_states.device)
+
+    #     return draft_tokens, retrieve_indices, tree_mask, tree_position_ids
+
+
     @torch.no_grad()
     def topK_genrate(self, hidden_states, input_ids, head, logits_processor):
+        device = hidden_states.device
+        input_ids = input_ids.to(device)
 
-        input_ids = input_ids.to(hidden_states.device)
         total_tokens = self.total_tokens
-        depth = self.depth
-        top_k = self.top_k
+        depth       = self.depth
+        top_k       = self.top_k
+        expand_k    = self.expand_k
 
         sample_token = input_ids[:, -1]
 
-        scores_list = []
-        parents_list = []
-        ss_token = []
+        scores_list = []    # 각 레벨 [num_nodes, top_k] 점수
+        ss_token    = []    # 각 레벨 [num_nodes, top_k] 토큰
 
-        input_ids = input_ids[:, 1:]
-        input_ids = input_ids.to(hidden_states.device)
-
-        len_posi = input_ids.shape[1]
+        # 프롬프트로 KV warm
+        input_ids = input_ids[:, 1:].to(device)
+        len_posi  = input_ids.shape[1]
         self.reset()
 
-        # with Timer("draft many"):
         if hasattr(self, "stable_kv") and self.stable_kv is not None:
             kv_len = self.stable_kv[0][0].shape[2]
-            out_hidden, past_key_values = self(hidden_states, input_ids=input_ids[:, kv_len:],
-                                               past_key_values=self.stable_kv, use_cache=True)
+            if kv_len < input_ids.shape[1]:
+                out_hidden, past_key_values = self(
+                    hidden_states, input_ids=input_ids[:, kv_len:],
+                    past_key_values=self.stable_kv, use_cache=True)
+            else:
+                # 새로 돌릴 토큰이 없음: 직전 히든/캐시 재사용
+                out_hidden, past_key_values = hidden_states, self.stable_kv
         else:
-            out_hidden, past_key_values = self(hidden_states, input_ids=input_ids, use_cache=True)
+            out_hidden, past_key_values = self(
+                hidden_states, input_ids=input_ids, use_cache=True)
+
+
         self.stable_kv = past_key_values
-        last_hidden = out_hidden[:, -1]
 
-        last_headout = head(last_hidden)
+        # ---------------- level 0 : top-k ----------------
+        last_hidden  = out_hidden[:, -1]             # [1, D]
+        last_headout = head(last_hidden)             # [1, V]
+        last_p       = self.logsoftmax(last_headout) # [1, V]
+        top          = torch.topk(last_p, top_k, dim=-1)
+        topk_index, topk_p = top.indices, top.values # [1, top_k]
 
-        last_p = self.logsoftmax(last_headout)
-        top = torch.topk(last_p, top_k, dim=-1)
-        topk_index, topk_p = top.indices, top.values
-        scores = topk_p[0]
-        scores_list.append(scores[None])
-        parents_list.append(torch.zeros(1, dtype=torch.long, device=scores.device))
-        ss_token.append(topk_index)
-        input_ids = topk_index
-        input_hidden = last_hidden[None].repeat(1, top_k, 1)
-        tree_mask = self.tree_mask_init
-        topk_cs_index = torch.arange(top_k, device=self.embed_tokens.weight.device)
+        scores = topk_p[0]                           # [top_k]
+        scores_list.append(scores[None])             # [1, top_k]
+        ss_token.append(topk_index)                  # [1, top_k]
 
-        # 4
-        for i in range(depth):
+        # 다음 스텝 입력(노드=top_k)
+        input_ids    = topk_index                    # [1, top_k]
+        input_hidden = last_hidden[None].repeat(1, top_k, 1)  # [1, top_k, D]
+
+        # --- ADDED: 레벨0 인덱스 범위 가드 ---
+        vocab = int(self.embed_tokens.num_embeddings)
+        if (input_ids.min() < 0) or (input_ids.max() >= vocab):
+            raise RuntimeError(
+                f"[EAGLE2] topK_genrate level-0: token id out of range. "
+                f"min={int(input_ids.min())}, max={int(input_ids.max())}, vocab={vocab}"
+            )
+
+        # 트리 마스크 초기화 (노드 수 = top_k)
+        tree_mask  = self.tree_mask_init
+        cur_nodes  = top_k
+
+        # 전역(flat) 토큰 인덱스 오프셋
+        token_offset      = 0
+        draft_parents_all = []  # 각 토큰의 부모 토큰(flat) 인덱스(+1; 루트=0)
+        draft_parents_all.append(torch.zeros(top_k, dtype=torch.long, device=device))
+        token_offset     += top_k
+
+        # 현재 레벨 노드의 “부모 토큰”(레벨0은 자기 자신)
+        parent_token_of_nodes = torch.arange(top_k, dtype=torch.long, device=device)
+
+        # position_ids 베이스(길이 1을 cur_nodes로 확장)
+        pos_base = self.position_ids
+        if pos_base.dim() == 2:
+            pos_base = pos_base[:, :1]   # [1,1] 보장
+
+
+        # ---------------- levels 1..depth ----------------
+        # (기존) for i in range(depth):
+        for level in range(1, depth + 1):
             self.tree_mask = tree_mask
-            position_ids = len_posi + self.position_ids
-            # with Timer("draft one"):
-            out_hidden, past_key_values = self(input_hidden, input_ids=input_ids, past_key_values=past_key_values,
-                                               position_ids=position_ids, use_cache=True)
+
+            S = input_ids.size(1)  # 현재 노드 수
+
+            # 항상 [B=1, S]로 맞춤
+            position_ids = torch.full((1, S), len_posi, device=input_ids.device, dtype=torch.long)
+
+            # 한 스텝 확장
+            out_hidden, past_key_values = self(
+                input_hidden, input_ids=input_ids,
+                past_key_values=past_key_values,
+                position_ids=position_ids, use_cache=True
+            )
             len_posi += 1
 
-            # with Timer("sort1"):
-            bias1 = top_k if i > 0 else 0
-            bias2 = max(0, i - 1)
-            bias = 1 + top_k ** 2 * bias2 + bias1
-            parents = (topk_cs_index + bias)
-            parents_list.append(parents)
+            # 노드별 top-k
+            last_headout = head(out_hidden[0])           # [S, V]
+            last_p       = self.logsoftmax(last_headout) # [S, V]
+            top          = torch.topk(last_p, top_k, dim=-1)
+            topk_index, topk_p = top.indices, top.values # [S, top_k]
 
-            last_headout = head(out_hidden[0])
-            last_p = self.logsoftmax(last_headout)
+            cu_scores = topk_p + scores[:, None]         # [S, top_k]
 
-            top = torch.topk(last_p, top_k, dim=-1)
-            topk_index, topk_p = top.indices, top.values
+            # 이번 레벨 모든 후보 토큰의 부모 토큰(flat+1; 루트=0)
+            parents_for_tokens = (parent_token_of_nodes + 1).view(-1, 1).expand(S, top_k)
+            draft_parents_all.append(parents_for_tokens.reshape(-1))
 
-            cu_scores = topk_p + scores[:, None]
+            # 전역 상위 expand_k 선택
+            flat = cu_scores.reshape(-1)                 # [S * top_k]
+            if expand_k > flat.numel():
+                raise RuntimeError(
+                    f"[EAGLE2] expand_k(={expand_k}) > cur_nodes*top_k(={flat.numel()}); "
+                    f"check depth/top_k/expand_k."
+                )
+            sel     = torch.topk(flat, expand_k, dim=-1)
+            flat_idx, scores = sel.indices, sel.values   # [expand_k]
 
-            topk_cs = torch.topk(cu_scores.view(-1), top_k, dim=-1)
-            topk_cs_index, topk_cs_p = topk_cs.indices, topk_cs.values
-            scores = topk_cs_p
+            out_ids = flat_idx // top_k                  # [expand_k] 부모 노드 인덱스
 
-            out_ids = topk_cs_index // top_k
-            input_hidden = out_hidden[:, out_ids]
+            # --- 디버그 프린트는 여기! (루프 '안'에서만 사용) ---
+            # print(f"[DBG] level {level}: S={S}, tree_mask.size={tuple(tree_mask.size())}, "
+                # f"min(out_ids)={int(out_ids.min())}, max(out_ids)={int(out_ids.max())}")
 
-            input_ids = topk_index.view(-1)[topk_cs_index][None]
+            # --- OOB 가드: out_ids는 반드시 0..S-1 ---
+            if (out_ids.min() < 0) or (out_ids.max() >= S):
+                raise RuntimeError(
+                    f"[EAGLE2] tree_mask index OOB at level-{level}: "
+                    f"min(out_ids)={int(out_ids.min())}, max(out_ids)={int(out_ids.max())}, "
+                    f"mask_nodes(dim2)={S}, top_k={top_k}, expand_k={expand_k}"
+                )
 
-            ss_token.append(topk_index)
-            scores_list.append(cu_scores)
-            tree_mask = torch.cat((tree_mask[:, :, out_ids], self.tree_mask_init), dim=3)
+            # --- 베이스 마스크 보정: 노드축이 S와 다르면 identity(S) 사용 ---
+            if tree_mask.size(2) != S:
+                base_mask = torch.eye(S, device=device, dtype=torch.bool)[None, None]
+            else:
+                base_mask = tree_mask
+
+            # 다음 스텝 입력(선택된 노드만 유지)
+            input_hidden = out_hidden[:, out_ids]                 # [1, expand_k, D]
+            input_ids    = topk_index.reshape(-1)[flat_idx][None] # [1, expand_k]
+
+            # 토큰 id 범위 가드
+            if (input_ids.min() < 0) or (input_ids.max() >= vocab):
+                raise RuntimeError(
+                    f"[EAGLE2] topK_genrate level-{level}: token id out of range. "
+                    f"min={int(input_ids.min())}, max={int(input_ids.max())}, vocab={vocab}"
+                )
+
+            # 기록
+            ss_token.append(topk_index)     # [S, top_k]
+            scores_list.append(cu_scores)   # [S, top_k]
+
+            # 트리 마스크 갱신 (보정된 base_mask 기준)
+            selected  = base_mask[:, :, out_ids]                 # [..., expand_k, t]
+            init_next = torch.zeros_like(selected[:, :, :, :1])
+            tree_mask = torch.cat((selected, init_next), dim=3)
+
+            # 다음 레벨의 부모 토큰(flat) 갱신
+            parent_token_of_nodes = token_offset + flat_idx      # [expand_k]
+
+            # 플랫 오프셋 전진
+            token_offset += S * top_k
+
+            # 다음 루프 노드 수
+            cur_nodes = expand_k
 
 
 
-        scores_list = torch.cat(scores_list, dim=0).view(-1)
-        ss_token_list = torch.cat(ss_token, dim=0).view(-1)
-        top_scores = torch.topk(scores_list, total_tokens, dim=-1)
-        top_scores_index = top_scores.indices
-        top_scores_index = torch.sort(top_scores_index).values
+        # ---------------- 결과 선택/트리 구성 ----------------
+        scores_flat    = torch.cat(scores_list, dim=0).view(-1)
+        ss_token_flat  = torch.cat(ss_token,   dim=0).view(-1)
+        parents_flat   = torch.cat(draft_parents_all, dim=0).long()
 
-        draft_tokens = ss_token_list[top_scores_index]
+        top_scores = torch.topk(scores_flat, total_tokens, dim=-1)
+        top_idx    = torch.sort(top_scores.indices).values
+
+        draft_tokens = ss_token_flat[top_idx]
         draft_tokens = torch.cat((sample_token, draft_tokens), dim=0)
 
-        draft_parents = torch.cat(parents_list, dim=0)[top_scores_index // top_k].long()
-        mask_index = torch.searchsorted(top_scores_index, draft_parents - 1, right=False)
-        # mask_index[(top_scores_index[mask_index]!=draft_parents - 1)]=-1
+        draft_parents = parents_flat[top_idx]  # (+1; 루트=0)
+
+        # 부모를 “선택 집합 내부 인덱스”로 사상 (루트는 -1)
+        mask_index = torch.searchsorted(top_idx, draft_parents - 1, right=False)
         mask_index[draft_parents == 0] = -1
         mask_index = mask_index + 1
         mask_index_list = mask_index.tolist()
-        # with Timer("mask"):
-        tree_mask = torch.eye(total_tokens + 1).bool()
+
+        # 트리 마스크/포지션
+        tree_mask = torch.eye(total_tokens + 1, device=device).bool()
         tree_mask[:, 0] = True
         for i in range(total_tokens):
             tree_mask[i + 1].add_(tree_mask[mask_index_list[i]])
 
-
         tree_position_ids = torch.sum(tree_mask, dim=1) - 1
 
-        tree_mask = tree_mask.float()[None, None]
-        draft_tokens = draft_tokens[None]
+        tree_mask     = tree_mask.float()[None, None]
+        draft_tokens  = draft_tokens[None]
+        tree_position_ids = tree_position_ids.to(device)
 
-        del parents_list, scores_list, ss_token, ss_token_list, draft_parents
+        # retrieve_indices (원본 로직 유지)
+        max_depth   = torch.max(tree_position_ids) + 1
+        noleaf_idx  = torch.unique(mask_index).tolist()
+        noleaf_num  = len(noleaf_idx) - 1
+        leaf_num    = total_tokens - noleaf_num
 
-        # with Timer("retrieve"):
-
-        max_depth = torch.max(tree_position_ids) + 1
-        noleaf_index = torch.unique(mask_index).tolist()
-        noleaf_num = len(noleaf_index) - 1
-        leaf_num = total_tokens - noleaf_num
-
-        retrieve_indices = torch.zeros(leaf_num, max_depth.item(), dtype=torch.long) - 1
+        retrieve_indices = torch.zeros(leaf_num, max_depth.item(), dtype=torch.long, device=device) - 1
         retrieve_indices = retrieve_indices.tolist()
 
         rid = 0
-        position_ids_list = tree_position_ids.tolist()
-
+        pos_list = tree_position_ids.tolist()
         for i in range(total_tokens + 1):
-            if i not in noleaf_index:
+            if i not in noleaf_idx:
                 cid = i
-                depth = position_ids_list[i]
-                for j in reversed(range(depth + 1)):
+                dpt = pos_list[i]
+                for j in reversed(range(dpt + 1)):
                     retrieve_indices[rid][j] = cid
                     cid = mask_index_list[cid - 1]
                 rid += 1
 
         if logits_processor is not None:
             maxitem = total_tokens + 5
-
             def custom_sort(lst):
-                # sort_keys=[len(list)]
-                sort_keys = []
-                for i in range(len(lst)):
-                    sort_keys.append(lst[i] if lst[i] >= 0 else maxitem)
-                return sort_keys
-
+                return [x if x >= 0 else maxitem for x in lst]
             retrieve_indices = sorted(retrieve_indices, key=custom_sort)
 
-        retrieve_indices = torch.tensor(retrieve_indices, dtype=torch.long)
-        del mask_index, mask_index_list, noleaf_index, noleaf_num, leaf_num, max_depth, rid
-        tree_position_ids = tree_position_ids.to(hidden_states.device)
+        retrieve_indices = torch.tensor(retrieve_indices, dtype=torch.long, device=device)
 
         return draft_tokens, retrieve_indices, tree_mask, tree_position_ids
+
 
 
 

@@ -229,29 +229,58 @@ def initialize_tree0(input_ids, model, past_key_values, logits_processor):
     #     return draft_tokens, retrieve_indices,tree_mask,tree_position_ids, hidden_states, token
     return draft_tokens, retrieve_indices,tree_mask,tree_position_ids, logits, hidden_state, sample_token
 
-def initialize_tree(input_ids, model, past_key_values, logits_processor):
+@torch.no_grad()
+def initialize_tree(input_ids, model, past_key_values, logits_processor=None):
+    """
+    EAGLE2(cnets1) 호환:
+    - prefill로 (B, T, H) hidden 확보
+    - 다음 토큰 1개 샘플 → input_ids에 append (길이 T+1)
+    - 그 1스텝을 KV로 전진하여 hidden을 (B, T+1, H)로 확장
+    - ★ cnets1.topK_genrate는 내부에서 input_ids[:,1:]로 한 칸 자르므로,
+      hidden_states도 앞에서 1토큰 잘라 (B, T, H)로 맞춰 전달
+    반환: draft_tokens, retrieve_indices, tree_mask, tree_position_ids, orig_logits, hidden_states2, token
+    """
+    device = input_ids.device
+
+    # 1) Prefill: 현재 prompt까지 한 번 전진
     outputs, orig, hidden_states = model(
         input_ids, past_key_values=past_key_values, output_orig=True
+    )   # hidden_states: (B, T, H)
+
+    # 2) 다음 토큰 1개 샘플
+    last_logits = orig[:, -1]  # (B, V)
+    if logits_processor is not None:
+        last_logits = logits_processor(None, last_logits)
+        probs = torch.softmax(last_logits, dim=-1)
+        token = torch.multinomial(probs, 1)                 # (B,1)
+    else:
+        token = torch.argmax(last_logits, dim=-1, keepdim=True)  # (B,1)
+
+    # 3) input_ids에 붙이고…
+    input_ids2 = torch.cat([input_ids, token.to(device)], dim=1)  # (B, T+1)
+
+    # 4) 그 토큰 1스텝을 KV로 전진시켜 hidden을 (B, T+1, H)로 확장
+    outputs2, orig2, hidden_last = model(
+        token, past_key_values=past_key_values, output_orig=True
+    )   # hidden_last: (B, 1, H)
+    hidden_states2 = torch.cat([hidden_states, hidden_last], dim=1)  # (B, T+1, H)
+
+    # 5) ★ cnets1.topK_genrate는 내부에서 input_ids[:,1:] 합니다.
+    #    따라서 hidden_states도 BOS를 제외해 길이를 맞춰 전달해야 합니다.
+    hidden_states2_trim = hidden_states2[:, 1:, :]  # (B, T, H)  ← T = (T+1) - 1
+
+    # 6) EAGLE2(cnets1)용 topK_genrate 호출 (4-인자 시그니처)
+    draft_tokens, retrieve_indices, tree_mask, tree_position_ids = model.ea_layer.topK_genrate(
+        hidden_states2_trim,          # ✅ (B, T, H)  ← input_ids2[:,1:]와 길이 정합
+        input_ids2,                   #  (B, T+1)    ← 함수 내부에서 [:,1:]로 맞춤
+        model.base_model.lm_head,
+        logits_processor
     )
 
-    if logits_processor is not None:
-        logits = orig[:, -1]
-        logits = logits_processor(None, logits)
-        probabilities = torch.nn.functional.softmax(logits, dim=1)
-        token = torch.multinomial(probabilities, 1)
-    else:
-        token = torch.argmax(orig[:, -1])
-        token = token[None, None]
-    input_ids = torch.cat((input_ids, token.to(input_ids.device)), dim=1)
+    # 반환 포맷 유지 (ea_model.eagenerate가 기대)
+    return draft_tokens, retrieve_indices, tree_mask, tree_position_ids, orig, hidden_states2, token
 
-    # Clone the output hidden states
-    if model.use_eagle3:
-        ea_device = model.ea_layer.lm_head.weight.device
-        if outputs["hidden_states"][0].device != ea_device:
-            outputs["hidden_states"] = [x.to(ea_device) for x in outputs["hidden_states"]]
-        hidden_states=torch.cat(outputs["hidden_states"],dim=-1)
-    draft_tokens, retrieve_indices,tree_mask,tree_position_ids = model.ea_layer.topK_genrate(hidden_states, input_ids, model.base_model.lm_head,logits_processor)
-    return draft_tokens, retrieve_indices,tree_mask,tree_position_ids, orig, hidden_states, token
+
 
 
 def reset_tree_mode(
@@ -430,47 +459,80 @@ def update_inference_inputs(
         hidden_state_new,
         sample_p
 ):
+    """
+    EAGLE2(cnets1) 호환을 위해:
+    - cnets1.topK_genrate는 input_ids[:,1:]를 사용하므로 hidden_states 길이 == input_ids[:,1:].shape[1] 이어야 함
+    - (기존) 전체 시퀀스를 넘기면 길이 불일치가 발생 -> 로컬 세그먼트만 구성해서 전달
+    - 또한 sample_p로 뽑은 token에 대해 1스텝 히든을 구해 hidden_states 길이를 맞춰 준다.
+    """
+
+    device = input_ids.device
     prev_input_len = input_ids.shape[1]
-    # Map the best candidate indices to the original indices in the sequence
-    select_indices = (
-            retrieve_indices[best_candidate, : accept_length + 1] + prev_input_len
-    )
-    # Append the tokens from the best candidate to the input sequence
-    input_ids = torch.cat(
-        [input_ids, candidates[None, best_candidate, : accept_length + 1].to(input_ids.device)], dim=-1
-    )
-    # Update the past key values based on the selected tokens
-    # Source tensor that contains relevant past information based on the selected candidate
+
+    # 1) 선택된 후보 토큰(accept_length+1개)을 본 시퀀스에 append
+    seg_tokens = candidates[None, best_candidate, : accept_length + 1].to(device)   # (1, L)
+    input_ids = torch.cat([input_ids, seg_tokens], dim=-1)                          # (1, T + L)
+
+    # 2) past_key_values 데이터에 해당 토큰들의 KV를 복사/반영
+    #    (retrieve_indices는 전역 인덱스 기준이므로 prev_input_len 오프셋을 더해줌)
+    select_indices = retrieve_indices[best_candidate, : accept_length + 1] + prev_input_len  # (L,)
     for past_key_values_data in past_key_values_data_list:
-        tgt = past_key_values_data[..., select_indices.to(past_key_values_data.device), :]
-        # Destination tensor where the relevant past information will be stored
-        dst = past_key_values_data[..., prev_input_len: prev_input_len + tgt.shape[-2], :]
-        # Copy relevant past information from the source to the destination
+        tgt = past_key_values_data[..., select_indices.to(past_key_values_data.device), :]                 # (..., L, D)
+        dst = past_key_values_data[..., prev_input_len: prev_input_len + tgt.shape[-2], :]                 # (..., L, D)
         dst.copy_(tgt, non_blocking=True)
+    current_length_data.fill_(prev_input_len + select_indices.shape[0])  # 현재 길이 갱신
 
-    # Update the current length tensor (currently only support batch size is 1)
-    current_length_data.fill_(prev_input_len + tgt.shape[-2])
+    # 3) 이번 스텝에서 사용할 로컬 히든 선택 (검증 단계에서 얻은 hidden_state_new에서 인덱싱)
+    #    shape: (1, L, H)
+    retrieve_hidden_state_new = hidden_state_new[:, retrieve_indices]                   # (1, num_paths, depth, H) 였던 걸
+    accept_hidden_state_new   = retrieve_hidden_state_new[:, best_candidate, : accept_length + 1]  # (1, L, H)
 
-    retrieve_hidden_state_new = hidden_state_new[:, retrieve_indices]
-    accept_hidden_state_new = retrieve_hidden_state_new[:, best_candidate, : accept_length + 1]
-    # token=model.base_model.lm_head(accept_hidden_state_new[:,-1]).argmax()
-    # token=token[None,None]
-    prob = sample_p
+    # 4) sample_p에서 다음 토큰 1개 샘플
+    if isinstance(sample_p, list):
+        prob = torch.stack(sample_p)[0]
+    else:
+        prob = sample_p
     if logits_processor is not None:
-        token = torch.multinomial(prob, 1)
-        token = token[None]
+        token = torch.multinomial(prob, 1)             # (1,)
+        token = token[None]                            # (1,1)
     else:
         token = torch.argmax(prob)
-        token = token[None, None]
-    # hidden_state = torch.cat((hidden_state, accept_hidden_state_new), dim=1)
-    draft_tokens, retrieve_indices,tree_mask,tree_position_ids = model.ea_layer.topK_genrate(accept_hidden_state_new,
-                                              input_ids=torch.cat((input_ids, token.to(input_ids.device)), dim=1),
-                                              head=model.base_model.lm_head,logits_processor=logits_processor)
+        token = token[None, None]                      # (1,1)
 
+    # 5) 토큰을 본 시퀀스에도 append (전역 시퀀스)
+    input_ids = torch.cat([input_ids, token.to(device)], dim=1)   # (1, T + L + 1)
+
+    # 6) ★ EAGLE2의 topK_genrate에 넘길 "로컬" pair 구성
+    #    - input_ids_for_topk: [직전 1토큰] + [방금 수용된 L토큰] + [sample 토큰]  → 길이 L+2
+    #      내부에서 [:,1:]로 잘리면 길이 L+1
+    #    - hidden_for_topk:    [수용된 L토큰의 히든] + [sample 토큰 1스텝 히든]      → 길이 L+1
+    #
+    #    sample 토큰 1스텝 히든을 얻기 위해 EaModel.forward를 1스텝 호출
+    #    (EaModel은 self.past_key_values를 들고 있으므로 여기서 호출 가능)
+    #    반환 hidden은 (B,1,H)
+    _, _, hidden_step = model(
+        token.to(device),
+        past_key_values=model.past_key_values,   # ea_model.eagenerate에서 세팅됨
+        output_orig=True
+    )
+    hidden_for_topk = torch.cat([accept_hidden_state_new, hidden_step], dim=1)  # (1, L+1, H)
+
+    # 로컬 input_ids: 직전 1토큰 + 방금 수용된 L토큰 + sample 토큰
+    last_prev_token = input_ids[:, -(accept_length + 1 + 1 + 1)]  # 직전 1토큰 = 새로 붙인 L+1(수용+샘플) 앞의 토큰
+    input_ids_for_topk = torch.cat([last_prev_token[:, None], seg_tokens, token.to(device)], dim=1)  # (1, L+2)
+
+    # 7) EAGLE2(cnets1)용 topK_genrate 호출  (⚠ attention_mask 인자 절대 넘기지 말 것)
+    draft_tokens, retrieve_indices, tree_mask, tree_position_ids = model.ea_layer.topK_genrate(
+        hidden_for_topk,                    # (1, L+1, H)
+        input_ids=input_ids_for_topk,       # (1, L+2)  → 내부에서 [:,1:] 되어 (1, L+1)
+        head=model.base_model.lm_head,
+        logits_processor=logits_processor
+    )
 
     new_token += accept_length + 1
 
-    return input_ids, draft_tokens, retrieve_indices,tree_mask,tree_position_ids, new_token, None, token
+    # ea_model.eagenerate가 기대하는 반환 형식 유지
+    return input_ids, draft_tokens, retrieve_indices, tree_mask, tree_position_ids, new_token, None, token
 
 
 if __name__ == "__main__":

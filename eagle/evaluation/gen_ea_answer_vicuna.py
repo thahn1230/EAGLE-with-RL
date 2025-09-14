@@ -103,9 +103,10 @@ def get_model_answers(
     model = EaModel.from_pretrained(
         base_model_path=base_model_path,
         ea_model_path=ea_model_path,
-        total_token=args.total_token,
-        depth=args.depth,
-        top_k=args.top_k,
+        total_token=args.total_token, # rerank-k
+        depth=args.depth, # tree depth
+        top_k=args.top_k, # child node generation k
+        expand_k=args.expand_k, # node expansion k
         torch_dtype=torch.float16,
         low_cpu_mem_usage=True,
         # load_in_8bit=True,
@@ -190,6 +191,12 @@ def get_model_answers(
             wall_time.append(total_time)
             conv.messages[-1][-1] = output
     print('Warmup done')
+    
+    # === TPS accumulators (in-memory) ===
+    tps_from_new_tokens = []   # sum(new_tokens) / sum(wall_time)
+    tps_from_tokenizer = []    # tokenizer로 재계산한 토큰 수 / sum(wall_time)
+    total_time_sec = 0.0
+    total_tokens_tokenizer = 0
 
     # questions=questions[6:]
     for question in tqdm(questions):
@@ -254,6 +261,20 @@ def get_model_answers(
                 wall_time.append(total_time)
                 conv.messages[-1][-1] = output
             # torch.cuda.empty_cache()
+            # ---- 여기서 choice별 TPS를 집계 ----
+            times = sum(wall_time)
+            tokens_direct = sum(new_tokens)  # 모델이 리포트한 생성 토큰 수
+            tps_from_new_tokens.append(tokens_direct / times if times > 0 else 0.0)
+
+            tokens_tok = 0                   # tokenizer로 재계산(검증용)
+            for text in turns:
+                tokens_tok += len(tokenizer(text).input_ids) - 1
+            tps_from_tokenizer.append(tokens_tok / times if times > 0 else 0.0)
+
+            total_time_sec += times
+            total_tokens_tokenizer += tokens_tok
+            # ----------------------------------
+
             choices.append({"index": i, "turns": turns, "idxs": idxs, "new_tokens": new_tokens, "wall_time": wall_time})
 
         # Dump answers
@@ -267,6 +288,27 @@ def get_model_answers(
                 "tstamp": time.time(),
             }
             fout.write(json.dumps(ans_json) + "\n")
+    
+    # === TPS summary (in-memory) ===
+    import numpy as np
+    avg_tps_new = float(np.mean(tps_from_new_tokens)) if len(tps_from_new_tokens) else 0.0
+    avg_tps_tok = float(np.mean(tps_from_tokenizer)) if len(tps_from_tokenizer) else 0.0
+
+    print(f"\nTPS (avg, from new_tokens): {avg_tps_new:.3f} tok/s")
+    print(f"TPS (avg, from tokenizer):  {avg_tps_tok:.3f} tok/s")
+    if avg_tps_tok > 0:
+        print(f"TPS ratio (new_tokens/tokenizer): {avg_tps_new/avg_tps_tok:.4f}")
+    if total_time_sec > 0:
+        print(f"Overall TPS (tokenizer total): {total_tokens_tokenizer/total_time_sec:.3f} tok/s")
+    print(f"Accumulated: tokens={total_tokens_tokenizer}, time={total_time_sec:.3f}s")
+    
+    # Print final statistics
+    print(f"\nFinal Statistics:")
+    print(f"Total n_phase: {model.n_phase}")
+    print(f"Total n_accept: {model.n_accept}")
+    if model.n_phase > 0:
+        acceptance_rate = model.n_accept / model.n_phase
+        print(f"Average acceptance length: {(acceptance_rate + 1):.4f}")  # Same as acceptance rate in EAGLE
 
 
 def reorg_answer_file(answer_file):
@@ -335,6 +377,12 @@ if __name__ == "__main__":
         type=int,
         default=10,
         help="The maximum number of new generated tokens.",
+    )
+    parser.add_argument(
+        "--expand-k",
+        type=int,
+        default=10,
+        help="The number of nodes to expand in the next level (default: same as top-k).",
     )
     parser.add_argument(
         "--num-choices",

@@ -93,9 +93,11 @@ class EConfig(PretrainedConfig):
         pretraining_tp=1,
         tie_word_embeddings=False,
         rope_scaling=None,
+        draft_vocab_size=None,  # Add draft_vocab_size for EAGLE compatibility
         **kwargs,
     ):
         self.vocab_size = vocab_size
+        self.draft_vocab_size = draft_vocab_size if draft_vocab_size is not None else vocab_size
         self.max_position_embeddings = max_position_embeddings
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size

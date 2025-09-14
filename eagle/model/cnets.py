@@ -17,6 +17,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# for EAGLE-3
+
 """ PyTorch LLaMA model."""
 import copy
 import os
@@ -529,9 +531,9 @@ class Model(nn.Module):
         self.hidden_size = config.hidden_size
         self.midlayer = LlamaDecoderLayeremb(config)
         if hasattr(config, "target_hidden_size"):
-            self.fc = nn.Linear(config.target_hidden_size * 3, self.hidden_size, bias=False)
+            self.fc = nn.Linear(config.target_hidden_size * 2, self.hidden_size, bias=False)  # Changed from *3 to *2
         else:
-            self.fc = nn.Linear(config.hidden_size * 3, self.hidden_size, bias=False)
+            self.fc = nn.Linear(config.hidden_size * 2, self.hidden_size, bias=False)  # Changed from *3 to *2
         self.norm=LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.logsoftmax = nn.LogSoftmax(dim=-1)
 
